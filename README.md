@@ -2,7 +2,7 @@
 
 > Turn any academic paper into a two-host podcast you can interrupt and argue with.
 
-Built at **AI Hackfest** (MLH, April 18–19, 2026).
+Built for **AI Hackfest** (MLH, April 17-19, 2026).
 
 Paper2Pod takes a PDF and hands you a streaming, fully-voiced conversation between two AI hosts: **Alex** (the expert) and **Sam** (the curious co-host). It finishes in under a minute. Mid-episode, you can pause and ask your own question. Sam voices it, Alex answers it using the paper's actual text, and the episode resumes right where you left off.
 
@@ -22,7 +22,7 @@ We also pitch the script at the listener's level (*Explain like I'm 15*, *Curiou
 
 ### Best Use of Gemini API
 
-Gemini 2.0 Flash is the creative and reasoning core of the app:
+Gemini 2.5 Flash is the creative and reasoning core of the app:
 
 - **Structured dialogue synthesis.** A system prompt with cast definitions, pacing constraints, and spoken-style rules (contractions, disfluencies, no stage directions) produces a strict JSON array of turns via Gemini's `response_mime_type="application/json"`.
 - **Long-context grounding.** The full paper (up to ~180K chars) is passed in a single shot, with no chunking and no vector store, because Flash handles it cleanly.
@@ -136,72 +136,6 @@ paper-to-pod/
 | Click-to-jump transcript | `Player` component | UX signal, shows Q&A inline under the clip it was inserted after |
 | Download full episode as MP3 | `downloadEpisode()` | Client-side byte concatenation across main + Q&A clips |
 | Keyboard shortcuts | `Space` = play/pause, `A` = Ask Alex | Demo-friendly |
-
----
-
-## API
-
-### `POST /api/process`
-
-Multipart upload. Returns `text/event-stream`.
-
-**Form fields:**
-- `file` *(required)*: the PDF.
-- `expertise`: `eli5`, `undergrad` (default), or `expert`.
-
-**SSE event shapes:**
-```jsonc
-{"stage": "extracting"}
-{"stage": "extracted",    "charCount": 72341, "title": "Attention Is All You Need", "paperText": "…"}
-{"stage": "scripting"}
-{"stage": "scripted",     "lineCount": 24, "dialogue": [{"speaker":"Alex","text":"…"}, …]}
-{"stage": "synthesizing", "done": 0, "total": 24}
-{"stage": "clip",         "index": 0, "speaker": "Alex", "text": "…", "audio": "<b64 mp3>", "done": 3, "total": 24}
-{"stage": "done",         "total": 24}
-{"stage": "error",        "message": "…"}
-```
-
-### `POST /api/ask`
-
-JSON in, JSON out. Returns two voiced turns.
-
-```jsonc
-// Request
-{
-  "paper": "<full paper text from the earlier SSE event>",
-  "question": "Did they test this on anything other than English?",
-  "recent": [{"speaker": "Alex", "text": "…"}],  // optional, last few turns for grounding
-  "expertise": "undergrad"
-}
-
-// Response
-{
-  "turns": [
-    {"speaker": "Sam",  "text": "…", "audio": "<b64 mp3>"},
-    {"speaker": "Alex", "text": "…", "audio": "<b64 mp3>"}
-  ]
-}
-```
-
----
-
-## Demo-video outline (≤ 2 minutes)
-
-1. **(0:00–0:05)** "Hey, I'm [name] and this is my demo for AI Hackfest." *(required by MLH)*
-2. **(0:05-0:25)** Land on the site, pick the *Curious outsider* pill, drop a recognizable arXiv PDF (for example *Attention Is All You Need*). Show the three-stage SSE progress.
-3. **(0:25-0:55)** Playback begins as soon as the first clip is ready. Show the visualizer color-shift between Alex (lavender) and Sam (blue), and the active transcript line.
-4. **(0:55-1:30)** Hit **A**. In the modal, type a pointed question, for example *"Does this scale to languages with different word-order rules?"*, and submit. The episode pauses, Sam voices the question, Alex answers with paper-grounded specifics, and the episode resumes.
-5. **(1:30-1:50)** Click Download. Show the full MP3 (including your Q&A) hitting the user's disk.
-6. **(1:50-2:00)** Swap to *Explain like I'm 15* and generate again briefly to show how the same paper becomes a different episode.
-
----
-
-## Known constraints (hackathon-honest)
-
-- PDF extraction uses **PyPDF2**. Papers with heavy LaTeX / two-column layouts sometimes produce garbled text; if that happens, swap in `pymupdf` (no license issues) and `page.get_text()`.
-- The Gemini model name is `gemini-2.0-flash`. If your account has a different model GA'd (e.g. `gemini-2.5-flash`), override via `GEMINI_MODEL` in `.env`.
-- ElevenLabs free-tier has a monthly character budget. A ~25-line script plus one Q&A exchange is ~10-15K characters, so plan demos accordingly.
-- Browser autoplay policies mean the **first** play needs a user gesture. Clicking the dropzone counts, so the first clip does autoplay once data arrives.
 
 ---
 
