@@ -21,6 +21,7 @@ import base64
 import json
 import os
 import re
+import string
 from io import BytesIO
 from typing import Any, AsyncIterator, Literal
 
@@ -60,6 +61,8 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 ELEVEN_MODEL = os.getenv("ELEVEN_MODEL", "eleven_turbo_v2_5")
 TTS_CONCURRENCY = _env_int("TTS_CONCURRENCY", 4)
 MAX_PDF_CHARS = _env_int("MAX_PDF_CHARS", 180000, minimum=1000)
+MAX_RECEIPT_CHARS = 420
+PAGE_MARKER_RE = re.compile(r"\[\[PAGE\s+(\d+)\]\]", re.IGNORECASE)
 
 genai.configure(api_key=GEMINI_API_KEY)
 eleven = ElevenLabs(api_key=ELEVENLABS_API_KEY)
@@ -135,18 +138,58 @@ app.add_middleware(
 # Pipeline helpers
 # --------------------------------------------------------------------------- #
 
-def extract_pdf_text(pdf_bytes: bytes) -> str:
-    reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
-    pages = []
-    for page in reader.pages:
-        try:
-            pages.append(page.extract_text() or "")
-        except Exception:
-            continue
-    text = "\n\n".join(p.strip() for p in pages if p.strip())
+def _clean_extracted_text(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def extract_pdf_pages(pdf_bytes: bytes) -> list[dict[str, Any]]:
+    reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
+    pages = []
+    for idx, page in enumerate(reader.pages, start=1):
+        try:
+            text = _clean_extracted_text(page.extract_text() or "")
+        except Exception:
+            continue
+        if text:
+            pages.append({"page": idx, "text": text})
+    return pages
+
+
+def serialize_pages(pages: list[dict[str, Any]]) -> str:
+    chunks: list[str] = []
+    remaining = MAX_PDF_CHARS
+    for page in pages:
+        chunk = f"[[PAGE {page['page']}]]\n{page['text'].strip()}"
+        if remaining <= 0:
+            break
+        if len(chunk) > remaining:
+            chunk = chunk[:remaining].rstrip()
+        chunks.append(chunk)
+        remaining -= len(chunk) + 2
+    return "\n\n".join(chunks).strip()
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    text = serialize_pages(extract_pdf_pages(pdf_bytes))
     return text[:MAX_PDF_CHARS]
+
+
+def parse_marked_pages(paper_text: str) -> list[dict[str, Any]]:
+    matches = list(PAGE_MARKER_RE.finditer(paper_text))
+    if not matches:
+        clean = _clean_extracted_text(paper_text)
+        return [{"page": 1, "text": clean}] if clean else []
+
+    pages: list[dict[str, Any]] = []
+    for i, match in enumerate(matches):
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(paper_text)
+        text = _clean_extracted_text(paper_text[start:end])
+        if text:
+            pages.append({"page": int(match.group(1)), "text": text})
+    return pages
 
 
 def guess_title(text: str) -> str:
@@ -158,7 +201,7 @@ def guess_title(text: str) -> str:
     head = text[:1500]
     candidates = []
     for line in head.splitlines():
-        s = line.strip()
+        s = PAGE_MARKER_RE.sub("", line).strip()
         if not s or len(s) < 10 or len(s) > 220:
             continue
         if s.lower().startswith(("abstract", "introduction", "keywords", "doi:", "arxiv")):
@@ -207,6 +250,102 @@ def parse_dialogue(raw: str) -> list[dict[str, str]]:
     return out
 
 
+STOPWORDS = {
+    "about", "after", "again", "against", "alex", "also", "answer", "because",
+    "being", "between", "could", "does", "doing", "from", "have", "into",
+    "just", "like", "more", "most", "paper", "question", "really", "sam",
+    "should", "show", "than", "that", "their", "there", "these", "they",
+    "this", "those", "through", "using", "what", "when", "where", "which",
+    "while", "with", "would",
+}
+
+
+def _keywords(text: str) -> set[str]:
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{3,}", text.lower())
+    return {w.strip(string.punctuation) for w in words if w not in STOPWORDS}
+
+
+def _passages(text: str) -> list[str]:
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if len(p.strip()) >= 80]
+    if paragraphs:
+        return paragraphs
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    if len(sentences) <= 3:
+        return [" ".join(sentences)] if sentences else []
+    return [" ".join(sentences[i:i + 3]) for i in range(0, len(sentences), 3)]
+
+
+def _snippet(text: str, terms: set[str], max_chars: int = MAX_RECEIPT_CHARS) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= max_chars:
+        return compact
+
+    lower = compact.lower()
+    hit_positions = [lower.find(term) for term in terms if lower.find(term) >= 0]
+    center = min(hit_positions) if hit_positions else 0
+    start = max(0, center - max_chars // 3)
+    end = min(len(compact), start + max_chars)
+    start = max(0, end - max_chars)
+    excerpt = compact[start:end].strip()
+    if start > 0:
+        excerpt = "... " + excerpt
+    if end < len(compact):
+        excerpt = excerpt + " ..."
+    return excerpt
+
+
+def find_receipts(paper_text: str, query: str, limit: int = 3) -> list[dict[str, Any]]:
+    pages = parse_marked_pages(paper_text)
+    terms = _keywords(query)
+    if not pages:
+        return []
+
+    scored: list[tuple[int, int, str]] = []
+    for page in pages:
+        page_terms = _keywords(page["text"])
+        page_bias = len(terms & page_terms)
+        for passage in _passages(page["text"]):
+            passage_terms = _keywords(passage)
+            overlap = terms & passage_terms
+            score = len(overlap) * 4 + page_bias
+            if score > 0:
+                scored.append((score, int(page["page"]), passage))
+
+    if not scored:
+        return [
+            {
+                "page": int(page["page"]),
+                "text": _snippet(page["text"], terms),
+                "score": 0,
+            }
+            for page in pages[:limit]
+        ]
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    receipts: list[dict[str, Any]] = []
+    seen_pages: set[int] = set()
+    for score, page, passage in scored:
+        if page in seen_pages and len(receipts) < limit - 1:
+            continue
+        receipts.append({"page": page, "text": _snippet(passage, terms), "score": score})
+        seen_pages.add(page)
+        if len(receipts) >= limit:
+            break
+    return receipts
+
+
+def line_receipts(paper_text: str, dialogue: list[dict[str, str]]) -> dict[str, list[dict[str, Any]]]:
+    receipts: dict[str, list[dict[str, Any]]] = {}
+    for idx, line in enumerate(dialogue):
+        if line.get("speaker") != "Alex":
+            continue
+        matches = find_receipts(paper_text, line.get("text", ""), limit=2)
+        if matches:
+            receipts[str(idx)] = matches
+    return receipts
+
+
 async def generate_dialogue(paper_text: str, expertise: Expertise) -> list[dict[str, str]]:
     system = BASE_SYSTEM_PROMPT + "\n\nAUDIENCE\n" + EXPERTISE_FLAVOR[expertise]
     model = genai.GenerativeModel(
@@ -239,6 +378,82 @@ async def generate_short(prompt: str, system: str, temperature: float = 0.7) -> 
     text = (getattr(response, "text", "") or "").strip()
     # Kill leading/trailing quotes the model sometimes adds.
     return text.strip('"').strip()
+
+
+FOLLOWUP_SYSTEM = """You write suggested listener follow-up questions for Paper2Pod.
+Return ONLY a JSON array of exactly three strings.
+
+Rules:
+- Each question is 6 to 14 words.
+- Make them specific to the paper or current answer.
+- Prefer questions about evidence, limitations, baselines, assumptions, or practical meaning.
+- Do not repeat a question already asked.
+- No markdown and no commentary."""
+
+
+def parse_suggestions(raw: str) -> list[str]:
+    cleaned = _strip_code_fences(raw)
+    data: Any
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        data = re.split(r"\n+", cleaned)
+    if isinstance(data, dict):
+        data = data.get("suggestions") or data.get("questions") or []
+    if not isinstance(data, list):
+        return []
+
+    suggestions: list[str] = []
+    seen: set[str] = set()
+    for item in data:
+        question = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", str(item)).strip().strip('"')
+        question = re.sub(r"\s+", " ", question)
+        if not question:
+            continue
+        if not question.endswith("?"):
+            question += "?"
+        key = question.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        suggestions.append(question[:120])
+        if len(suggestions) >= 3:
+            break
+    return suggestions
+
+
+def fallback_suggestions() -> list[str]:
+    return [
+        "What is the strongest evidence for that claim?",
+        "What limitation should I keep in mind?",
+        "How does this compare with the baseline?",
+    ]
+
+
+async def generate_followups(
+    paper_text: str,
+    recent_turns: list[dict[str, str]],
+    expertise: Expertise,
+    focus: str = "",
+) -> list[str]:
+    model = genai.GenerativeModel(
+        model_name=GEMINI_MODEL,
+        system_instruction=FOLLOWUP_SYSTEM + "\n\n" + EXPERTISE_FLAVOR[expertise],
+        generation_config=genai.types.GenerationConfig(
+            response_mime_type="application/json",
+            temperature=0.65,
+            max_output_tokens=300,
+        ),
+    )
+    recent = "\n".join(f"{t['speaker']}: {t['text']}" for t in recent_turns[-8:])
+    prompt = (
+        (f"CURRENT FOCUS:\n{focus}\n\n" if focus else "")
+        + f"RECENT EPISODE CONTEXT:\n{recent}\n\n"
+        + f"PAPER EXCERPT:\n---\n{paper_text[:14000]}\n---"
+    )
+    response = await asyncio.to_thread(model.generate_content, prompt)
+    suggestions = parse_suggestions(getattr(response, "text", "") or "")
+    return suggestions or fallback_suggestions()
 
 
 def _voice_for_speaker(speaker: str) -> str:
@@ -310,10 +525,17 @@ async def process(
 
             yield _sse({"stage": "scripting"})
             dialogue = await generate_dialogue(text, level)
+            receipts = line_receipts(text, dialogue)
+            try:
+                suggestions = await generate_followups(text, dialogue, level)
+            except Exception:
+                suggestions = fallback_suggestions()
             yield _sse({
                 "stage": "scripted",
                 "lineCount": len(dialogue),
                 "dialogue": dialogue,
+                "lineReceipts": receipts,
+                "suggestions": suggestions,
             })
 
             total = len(dialogue)
@@ -450,16 +672,35 @@ async def ask(req: AskRequest) -> dict[str, Any]:
     if not alex_line:
         raise HTTPException(status_code=502, detail="Model returned an empty answer")
 
+    receipts = find_receipts(paper, f"{req.question}\n{sam_line}\n{alex_line}", limit=3)
+    recent_turns = [{"speaker": t.speaker, "text": t.text} for t in req.recent[-6:]]
+    followup_task = asyncio.create_task(generate_followups(
+        paper,
+        recent_turns + [
+            {"speaker": "Sam", "text": sam_line},
+            {"speaker": "Alex", "text": alex_line},
+        ],
+        req.expertise,
+        focus=req.question,
+    ))
+
     try:
         sam_audio, alex_audio = await asyncio.gather(
             synthesize_line(sam_line, "Sam"),
             synthesize_line(alex_line, "Alex"),
         )
     except Exception as exc:  # noqa: BLE001
+        followup_task.cancel()
+        await asyncio.gather(followup_task, return_exceptions=True)
         raise HTTPException(
             status_code=502,
             detail=f"Audio synthesis failed: {type(exc).__name__}: {exc}",
         ) from exc
+
+    try:
+        suggestions = await followup_task
+    except Exception:
+        suggestions = fallback_suggestions()
 
     return {
         "turns": [
@@ -472,8 +713,11 @@ async def ask(req: AskRequest) -> dict[str, Any]:
                 "speaker": "Alex",
                 "text": alex_line,
                 "audio": base64.b64encode(alex_audio).decode("utf-8"),
+                "receipts": receipts,
             },
-        ]
+        ],
+        "receipts": receipts,
+        "suggestions": suggestions,
     }
 
 

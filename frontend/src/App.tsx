@@ -28,11 +28,18 @@ interface Clip {
   speaker: SpeakerName;
   text: string;
   audio: string; // base64 mp3
+  receipts?: SourceReceipt[];
 }
 
 interface DialogueLine {
   speaker: SpeakerName;
   text: string;
+}
+
+interface SourceReceipt {
+  page: number;
+  text: string;
+  score?: number;
 }
 
 type Stage =
@@ -214,6 +221,7 @@ export default function App() {
   const [expertise, setExpertise] = useState<Expertise>("undergrad");
   const [paperText, setPaperText] = useState<string>("");
   const [paperTitle, setPaperTitle] = useState<string>("");
+  const [suggestedQuestions, setSuggestedQuestions] = useState<string[]>([]);
 
   // Playback state for the main episode
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -244,6 +252,7 @@ export default function App() {
   const askRequestIdRef = useRef(0);
   const shouldAutoPlayRef = useRef(false);
   const pendingMainSeekRef = useRef<number | null>(null);
+  const lineReceiptsRef = useRef<Record<number, SourceReceipt[]>>({});
 
   // Derived: who is currently speaking?
   const currentClip: Clip | null = qaActive
@@ -361,6 +370,50 @@ export default function App() {
     );
   };
 
+  const normalizeReceipts = (value: any): SourceReceipt[] => {
+    if (!Array.isArray(value)) return [];
+    return value
+      .filter((item) => (
+        item &&
+        Number.isFinite(Number(item.page)) &&
+        typeof item.text === "string" &&
+        item.text.trim().length > 0
+      ))
+      .slice(0, 3)
+      .map((item) => ({
+        page: Number(item.page),
+        text: item.text.trim(),
+        score: Number.isFinite(Number(item.score)) ? Number(item.score) : undefined,
+      }));
+  };
+
+  const normalizeReceiptMap = (value: any): Record<number, SourceReceipt[]> => {
+    if (!value || typeof value !== "object") return {};
+    const out: Record<number, SourceReceipt[]> = {};
+    for (const [key, receipts] of Object.entries(value)) {
+      const idx = Number(key);
+      if (!Number.isInteger(idx)) continue;
+      const normalized = normalizeReceipts(receipts);
+      if (normalized.length) out[idx] = normalized;
+    }
+    return out;
+  };
+
+  const normalizeSuggestions = (value: any): string[] => {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set<string>();
+    return value
+      .map((item) => String(item ?? "").trim())
+      .filter((item) => {
+        if (!item) return false;
+        const key = item.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 3);
+  };
+
   const handleEvent = useCallback((ev: any) => {
     switch (ev.stage) {
       case "extracting":
@@ -375,6 +428,8 @@ export default function App() {
         break;
       case "scripted":
         setDialogue(ev.dialogue ?? []);
+        lineReceiptsRef.current = normalizeReceiptMap(ev.lineReceipts);
+        setSuggestedQuestions(normalizeSuggestions(ev.suggestions));
         setClips(new Array(ev.lineCount).fill(null));
         setProgress({ done: 0, total: ev.lineCount });
         setStage("synthesizing");
@@ -394,6 +449,7 @@ export default function App() {
             speaker: ev.speaker,
             text: ev.text,
             audio: ev.audio,
+            receipts: lineReceiptsRef.current[ev.index] ?? [],
           };
           return next;
         });
@@ -427,6 +483,7 @@ export default function App() {
     }
     shouldAutoPlayRef.current = false;
     pendingMainSeekRef.current = null;
+    lineReceiptsRef.current = {};
     const el = audioRef.current;
     if (el) {
       el.pause();
@@ -448,6 +505,7 @@ export default function App() {
     setAwaitingNext(false);
     setPaperText("");
     setPaperTitle("");
+    setSuggestedQuestions([]);
     setQaByMainIdx({});
     setQaActive(null);
     setQaTurnIdx(0);
@@ -610,11 +668,12 @@ export default function App() {
   // "Ask Alex" flow
   // ---------------------------------------------------------------------------
 
-  const openAsk = () => {
+  const openAsk = (prefill = "") => {
     if (!paperText || stage !== "ready" || qaActive) return;
     const el = audioRef.current;
     shouldAutoPlayRef.current = false;
     if (el) el.pause();
+    setAskText(prefill);
     setAskOpen(true);
     setTimeout(() => askInputRef.current?.focus(), 80);
   };
@@ -672,11 +731,23 @@ export default function App() {
       }
       const data = await res.json();
       if (requestId !== askRequestIdRef.current || controller.signal.aborted) return;
-      const turns = Array.isArray(data.turns) ? data.turns.filter(isPlayableClip) : [];
+      const responseReceipts = normalizeReceipts(data.receipts);
+      const turns = Array.isArray(data.turns)
+        ? data.turns
+            .filter(isPlayableClip)
+            .map((turn: Clip) => ({
+              ...turn,
+              receipts: normalizeReceipts(turn.receipts).length
+                ? normalizeReceipts(turn.receipts)
+                : turn.speaker === "Alex" ? responseReceipts : [],
+            }))
+        : [];
       if (turns.length === 0 || turns.length !== data.turns?.length) {
         setAskError("No answer came back. Try rephrasing.");
         return;
       }
+      const nextSuggestions = normalizeSuggestions(data.suggestions);
+      if (nextSuggestions.length) setSuggestedQuestions(nextSuggestions);
       setQaByMainIdx((prev) => {
         const next = { ...prev };
         next[mainIdx] = [...(next[mainIdx] ?? []), ...turns];
@@ -849,6 +920,8 @@ export default function App() {
               setCurrentIndex(i);
             }}
             onAsk={openAsk}
+            suggestedQuestions={suggestedQuestions}
+            onSuggestion={(question) => openAsk(question)}
             canAsk={!!paperText}
             paperTitle={paperTitle}
           />
@@ -1140,6 +1213,8 @@ function Player({
   downloadEpisode,
   onJump,
   onAsk,
+  suggestedQuestions,
+  onSuggestion,
   canAsk,
   paperTitle,
 }: {
@@ -1163,6 +1238,8 @@ function Player({
   downloadEpisode: () => void;
   onJump: (i: number) => void;
   onAsk: () => void;
+  suggestedQuestions: string[];
+  onSuggestion: (question: string) => void;
   canAsk: boolean;
   paperTitle: string;
 }) {
@@ -1280,6 +1357,13 @@ function Player({
                 </button>
               )}
             </div>
+
+            <SourceReceipts receipts={currentClip?.receipts ?? []} />
+            <FollowupChips
+              questions={suggestedQuestions}
+              disabled={!canAsk || !!qaActive}
+              onPick={onSuggestion}
+            />
           </div>
         </div>
 
@@ -1353,6 +1437,80 @@ function Player({
         </div>
       </div>
     </section>
+  );
+}
+
+function SourceReceipts({ receipts }: { receipts: SourceReceipt[] }) {
+  if (!receipts.length) return null;
+  return (
+    <div className="mt-7 border-t border-white/10 pt-5 text-left">
+      <div className="mb-3 flex items-center gap-2">
+        <svg viewBox="0 0 24 24" className="h-4 w-4 text-[color:var(--color-accent-2)]" fill="none" stroke="currentColor" strokeWidth="1.6">
+          <path d="M6 4h9l3 3v13H6z" />
+          <path d="M15 4v4h4" />
+          <path d="M9 12h6" />
+          <path d="M9 16h4" />
+        </svg>
+        <p className="text-[10px] uppercase tracking-[0.28em] text-[color:var(--color-ink-dim)]">
+          Source receipts
+        </p>
+      </div>
+      <div className="space-y-3">
+        {receipts.map((receipt, i) => (
+          <div key={`${receipt.page}-${i}`} className="border-l border-[color:var(--color-accent-2)]/45 pl-3">
+            <div className="mb-1 flex items-center gap-2">
+              <span className="rounded-full bg-white/[0.06] px-2 py-0.5 text-[10px] font-medium text-white/70">
+                p. {receipt.page}
+              </span>
+              {receipt.score != null && receipt.score > 0 && (
+                <span className="text-[10px] text-white/30">
+                  match {receipt.score}
+                </span>
+              )}
+            </div>
+            <p className="text-xs leading-relaxed text-white/65">
+              {receipt.text}
+            </p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function FollowupChips({
+  questions,
+  disabled,
+  onPick,
+}: {
+  questions: string[];
+  disabled: boolean;
+  onPick: (question: string) => void;
+}) {
+  if (!questions.length) return null;
+  return (
+    <div className="mt-7 border-t border-white/10 pt-5">
+      <p className="mb-3 text-center text-[10px] uppercase tracking-[0.28em] text-[color:var(--color-ink-dim)]">
+        Suggested follow-ups
+      </p>
+      <div className="flex flex-wrap justify-center gap-2">
+        {questions.map((question) => (
+          <button
+            key={question}
+            onClick={() => onPick(question)}
+            disabled={disabled}
+            className={[
+              "max-w-full rounded-full border px-3 py-2 text-left text-xs leading-snug transition",
+              disabled
+                ? "cursor-not-allowed border-white/5 text-white/25"
+                : "border-white/10 bg-white/[0.03] text-white/75 hover:border-[color:var(--color-accent-2)]/50 hover:text-white",
+            ].join(" ")}
+          >
+            {question}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
 
