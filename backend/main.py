@@ -41,13 +41,25 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 if not GEMINI_API_KEY or not ELEVENLABS_API_KEY:
     raise RuntimeError("GEMINI_API_KEY and ELEVENLABS_API_KEY must be set in .env")
 
-ALEX_VOICE_ID = os.getenv("ALEX_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # Adam
-SAM_VOICE_ID = os.getenv("SAM_VOICE_ID", "EXAVITQu4vr4xnSDxMAc")    # Bella
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+ALEX_VOICE_ID = os.getenv("ALEX_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # Adam
+SAM_VOICE_ID = os.getenv("SAM_VOICE_ID", "hpp4J3VqNfWAUOO0d1Us")    # Bella
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 ELEVEN_MODEL = os.getenv("ELEVEN_MODEL", "eleven_turbo_v2_5")
-TTS_CONCURRENCY = int(os.getenv("TTS_CONCURRENCY", "4"))
-MAX_PDF_CHARS = int(os.getenv("MAX_PDF_CHARS", "180000"))
+TTS_CONCURRENCY = _env_int("TTS_CONCURRENCY", 4)
+MAX_PDF_CHARS = _env_int("MAX_PDF_CHARS", 180000, minimum=1000)
 
 genai.configure(api_key=GEMINI_API_KEY)
 eleven = ElevenLabs(api_key=ELEVENLABS_API_KEY)
@@ -229,19 +241,33 @@ async def generate_short(prompt: str, system: str, temperature: float = 0.7) -> 
     return text.strip('"').strip()
 
 
-def _synthesize_sync(text: str, voice_id: str) -> bytes:
+def _voice_for_speaker(speaker: str) -> str:
+    if speaker == "Alex":
+        return ALEX_VOICE_ID
+    if speaker == "Sam":
+        return SAM_VOICE_ID
+    raise ValueError(f"Unknown speaker for TTS: {speaker}")
+
+
+def _synthesize_sync(text: str, voice_id: str, speaker: str) -> bytes:
     audio_iter = eleven.text_to_speech.convert(
         voice_id=voice_id,
         text=text,
         model_id=ELEVEN_MODEL,
         output_format="mp3_44100_128",
     )
-    return b"".join(audio_iter)
+    audio = b"".join(chunk for chunk in audio_iter if chunk)
+    if not audio:
+        raise RuntimeError(f"ElevenLabs returned empty audio for {speaker} voice {voice_id}")
+    return audio
 
 
 async def synthesize_line(text: str, speaker: str) -> bytes:
-    voice_id = ALEX_VOICE_ID if speaker == "Alex" else SAM_VOICE_ID
-    return await asyncio.to_thread(_synthesize_sync, text, voice_id)
+    clean_text = text.strip()
+    if not clean_text:
+        raise ValueError("Cannot synthesize an empty line")
+    voice_id = _voice_for_speaker(speaker)
+    return await asyncio.to_thread(_synthesize_sync, clean_text, voice_id, speaker)
 
 
 # --------------------------------------------------------------------------- #
@@ -294,7 +320,7 @@ async def process(
             yield _sse({"stage": "synthesizing", "done": 0, "total": total})
 
             semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
-            ready_queue: asyncio.Queue[tuple[int, dict[str, str], bytes]] = asyncio.Queue()
+            ready_queue: asyncio.Queue[tuple[int, dict[str, Any], bytes]] = asyncio.Queue()
 
             async def worker(idx: int, line: dict[str, str]) -> None:
                 async with semaphore:
@@ -302,8 +328,18 @@ async def process(
                         audio = await synthesize_line(line["text"], line["speaker"])
                         await ready_queue.put((idx, line, audio))
                     except Exception as exc:  # noqa: BLE001
-                        await ready_queue.put((idx, line, b""))
-                        await ready_queue.put((-1, {"error": str(exc), "idx": idx}, b""))
+                        await ready_queue.put((
+                            -1,
+                            {
+                                "error": (
+                                    f"Failed to synthesize line {idx + 1} "
+                                    f"({line.get('speaker', 'unknown')}): "
+                                    f"{type(exc).__name__}: {exc}"
+                                ),
+                                "idx": idx,
+                            },
+                            b"",
+                        ))
 
             tasks = [asyncio.create_task(worker(i, l)) for i, l in enumerate(dialogue)]
 
@@ -311,8 +347,11 @@ async def process(
             while done < total:
                 idx, line, audio = await ready_queue.get()
                 if idx == -1:
-                    yield _sse({"stage": "warning", "message": line.get("error", "")})
-                    continue
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    yield _sse({"stage": "error", "message": line.get("error", "Audio synthesis failed")})
+                    return
                 done += 1
                 yield _sse({
                     "stage": "clip",
@@ -411,10 +450,16 @@ async def ask(req: AskRequest) -> dict[str, Any]:
     if not alex_line:
         raise HTTPException(status_code=502, detail="Model returned an empty answer")
 
-    sam_audio, alex_audio = await asyncio.gather(
-        synthesize_line(sam_line, "Sam"),
-        synthesize_line(alex_line, "Alex"),
-    )
+    try:
+        sam_audio, alex_audio = await asyncio.gather(
+            synthesize_line(sam_line, "Sam"),
+            synthesize_line(alex_line, "Alex"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"Audio synthesis failed: {type(exc).__name__}: {exc}",
+        ) from exc
 
     return {
         "turns": [

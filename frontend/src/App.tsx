@@ -72,6 +72,17 @@ function formatTime(sec: number): string {
   return `${m}:${s}`;
 }
 
+async function responseErrorMessage(res: Response, fallback: string): Promise<string> {
+  try {
+    const data = await res.clone().json();
+    if (typeof data.detail === "string" && data.detail.trim()) return data.detail;
+    if (typeof data.message === "string" && data.message.trim()) return data.message;
+  } catch {
+    /* use fallback */
+  }
+  return fallback;
+}
+
 const STAGE_COPY: Record<Exclude<Stage, "idle" | "ready" | "error">, string> = {
   extracting: "Reading the paper",
   scripting: "Writing the script",
@@ -227,6 +238,12 @@ export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const currentUrlRef = useRef<string | null>(null);
   const askInputRef = useRef<HTMLTextAreaElement>(null);
+  const processAbortRef = useRef<AbortController | null>(null);
+  const processRequestIdRef = useRef(0);
+  const askAbortRef = useRef<AbortController | null>(null);
+  const askRequestIdRef = useRef(0);
+  const shouldAutoPlayRef = useRef(false);
+  const pendingMainSeekRef = useRef<number | null>(null);
 
   // Derived: who is currently speaking?
   const currentClip: Clip | null = qaActive
@@ -246,6 +263,9 @@ export default function App() {
 
   const startProcessing = useCallback(async (file: File) => {
     resetState();
+    const requestId = ++processRequestIdRef.current;
+    const controller = new AbortController();
+    processAbortRef.current = controller;
     setFileName(file.name);
     setStage("extracting");
 
@@ -255,14 +275,26 @@ export default function App() {
 
     let res: Response;
     try {
-      res = await fetch(`${API_BASE}/api/process`, { method: "POST", body: form });
-    } catch {
+      res = await fetch(`${API_BASE}/api/process`, {
+        method: "POST",
+        body: form,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) {
+        return;
+      }
+      if (processAbortRef.current === controller) processAbortRef.current = null;
       setError("Could not reach the backend. Is it running on :8000?");
       setStage("error");
       return;
     }
+    if (requestId !== processRequestIdRef.current || controller.signal.aborted) return;
     if (!res.ok || !res.body) {
-      setError(`Server returned ${res.status}`);
+      if (processAbortRef.current === controller) processAbortRef.current = null;
+      const message = await responseErrorMessage(res, `Server returned ${res.status}`);
+      if (requestId !== processRequestIdRef.current || controller.signal.aborted) return;
+      setError(message);
       setStage("error");
       return;
     }
@@ -270,25 +302,64 @@ export default function App() {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const frames = buf.split("\n\n");
-      buf = frames.pop() ?? "";
-      for (const frame of frames) {
-        for (const line of frame.split("\n")) {
-          if (!line.startsWith("data: ")) continue;
-          try {
-            const ev = JSON.parse(line.slice(6));
-            handleEvent(ev);
-          } catch {
-            /* ignore malformed frame */
-          }
+    const applyFrame = (frame: string) => {
+      for (const line of frame.split("\n")) {
+        if (!line.startsWith("data: ")) continue;
+        if (requestId !== processRequestIdRef.current || controller.signal.aborted) return;
+        try {
+          const ev = JSON.parse(line.slice(6));
+          handleEvent(ev);
+        } catch {
+          /* ignore malformed frame */
         }
+      }
+    };
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (requestId !== processRequestIdRef.current || controller.signal.aborted) {
+          await reader.cancel().catch(() => {});
+          return;
+        }
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const frames = buf.split("\n\n");
+        buf = frames.pop() ?? "";
+        for (const frame of frames) applyFrame(frame);
+      }
+      buf += decoder.decode();
+      if (buf.trim()) applyFrame(buf);
+    } catch {
+      if (controller.signal.aborted || requestId !== processRequestIdRef.current) return;
+      setError("The backend connection closed while processing the paper.");
+      setStage("error");
+    } finally {
+      if (processAbortRef.current === controller) {
+        processAbortRef.current = null;
       }
     }
   }, [expertise]);
+
+  const isPlayableClip = (value: any): value is Clip => {
+    return (
+      value &&
+      (value.speaker === "Alex" || value.speaker === "Sam") &&
+      typeof value.text === "string" &&
+      value.text.trim().length > 0 &&
+      typeof value.audio === "string" &&
+      value.audio.length > 0
+    );
+  };
+
+  const isClipPayload = (value: any): value is Clip & { index: number; done: number; total: number } => {
+    return (
+      isPlayableClip(value) &&
+      Number.isInteger((value as any).index) &&
+      Number.isFinite((value as any).done) &&
+      Number.isFinite((value as any).total)
+    );
+  };
 
   const handleEvent = useCallback((ev: any) => {
     switch (ev.stage) {
@@ -312,6 +383,11 @@ export default function App() {
         setProgress({ done: ev.done ?? 0, total: ev.total ?? 0 });
         break;
       case "clip":
+        if (!isClipPayload(ev)) {
+          setError(`Missing or invalid audio for line ${(ev.index ?? 0) + 1}.`);
+          setStage("error");
+          break;
+        }
         setClips((prev) => {
           const next = prev.slice();
           next[ev.index] = {
@@ -339,6 +415,24 @@ export default function App() {
   }, []);
 
   const resetState = () => {
+    processRequestIdRef.current += 1;
+    if (processAbortRef.current) {
+      processAbortRef.current.abort();
+      processAbortRef.current = null;
+    }
+    askRequestIdRef.current += 1;
+    if (askAbortRef.current) {
+      askAbortRef.current.abort();
+      askAbortRef.current = null;
+    }
+    shouldAutoPlayRef.current = false;
+    pendingMainSeekRef.current = null;
+    const el = audioRef.current;
+    if (el) {
+      el.pause();
+      el.removeAttribute("src");
+      el.load();
+    }
     if (currentUrlRef.current) {
       URL.revokeObjectURL(currentUrlRef.current);
       currentUrlRef.current = null;
@@ -360,6 +454,7 @@ export default function App() {
     setAskOpen(false);
     setAskText("");
     setAskError(null);
+    setAskLoading(false);
   };
 
   // ---------------------------------------------------------------------------
@@ -397,27 +492,60 @@ export default function App() {
       setAwaitingNext(!qaActive && totalClips > 0 && currentIndex < totalClips);
       return;
     }
+    if (!clip.audio) {
+      setError("Missing audio for the current line.");
+      setStage("error");
+      return;
+    }
     setAwaitingNext(false);
     if (currentUrlRef.current) URL.revokeObjectURL(currentUrlRef.current);
     const url = base64ToBlobUrl(clip.audio);
     currentUrlRef.current = url;
-    el.src = url;
-    // If we're inside a Q&A overlay, always play. For the main episode, only
-    // autoplay once the user has started the session.
-    if (qaActive || isPlaying || currentIndex > 0) {
+
+    const shouldPlay = !!qaActive || shouldAutoPlayRef.current;
+    const hasPendingSeek = pendingMainSeekRef.current != null;
+
+    const playCurrent = () => {
       ensureGraph();
-      void el.play().catch(() => setIsPlaying(false));
+      void el.play().catch(() => {
+        if (!qaActive) shouldAutoPlayRef.current = false;
+        setIsPlaying(false);
+      });
+    };
+
+    const onMeta = () => {
+      const seekTo = pendingMainSeekRef.current;
+      if (seekTo != null) {
+        const max = Number.isFinite(el.duration) ? el.duration : seekTo;
+        el.currentTime = Math.max(0, Math.min(max, seekTo));
+        pendingMainSeekRef.current = null;
+      }
+      if (shouldPlay) playCurrent();
+    };
+
+    if (hasPendingSeek) el.addEventListener("loadedmetadata", onMeta, { once: true });
+    el.src = url;
+    if (!hasPendingSeek && shouldPlay) {
+      playCurrent();
     }
+    return () => {
+      if (hasPendingSeek) el.removeEventListener("loadedmetadata", onMeta);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentClip?.audio, qaActive?.mainIdx, qaTurnIdx]);
+  }, [currentIndex, currentClip?.audio, qaActive?.mainIdx, qaTurnIdx, totalClips]);
 
   const togglePlay = () => {
     const el = audioRef.current;
     if (!el) return;
     ensureGraph();
     if (el.paused) {
-      void el.play();
+      shouldAutoPlayRef.current = true;
+      void el.play().catch(() => {
+        shouldAutoPlayRef.current = false;
+        setIsPlaying(false);
+      });
     } else {
+      shouldAutoPlayRef.current = false;
       el.pause();
     }
   };
@@ -430,30 +558,18 @@ export default function App() {
       }
       // End of Q&A overlay → resume main episode where we left off.
       const resume = qaActive;
+      pendingMainSeekRef.current = resume.resumeTime;
+      shouldAutoPlayRef.current = true;
       setQaActive(null);
       setQaTurnIdx(0);
-      // Re-point audio element at the main clip and seek to resumeTime.
-      requestAnimationFrame(() => {
-        const el = audioRef.current;
-        if (!el) return;
-        const main = clips[resume.mainIdx];
-        if (!main) return;
-        if (currentUrlRef.current) URL.revokeObjectURL(currentUrlRef.current);
-        const url = base64ToBlobUrl(main.audio);
-        currentUrlRef.current = url;
-        el.src = url;
-        const onMeta = () => {
-          el.currentTime = Math.min(resume.resumeTime, el.duration || resume.resumeTime);
-          el.removeEventListener("loadedmetadata", onMeta);
-          void el.play().catch(() => {});
-        };
-        el.addEventListener("loadedmetadata", onMeta);
-      });
+      setCurrentIndex(resume.mainIdx);
       return;
     }
     if (currentIndex < totalClips - 1) {
+      shouldAutoPlayRef.current = true;
       setCurrentIndex((i) => i + 1);
     } else {
+      shouldAutoPlayRef.current = false;
       setIsPlaying(false);
     }
   };
@@ -495,31 +611,43 @@ export default function App() {
   // ---------------------------------------------------------------------------
 
   const openAsk = () => {
-    if (!paperText || stage !== "ready") return;
+    if (!paperText || stage !== "ready" || qaActive) return;
     const el = audioRef.current;
+    shouldAutoPlayRef.current = false;
     if (el) el.pause();
     setAskOpen(true);
     setTimeout(() => askInputRef.current?.focus(), 80);
   };
 
   const closeAsk = () => {
+    askRequestIdRef.current += 1;
+    if (askAbortRef.current) {
+      askAbortRef.current.abort();
+      askAbortRef.current = null;
+    }
     setAskOpen(false);
     setAskError(null);
     setAskText("");
+    setAskLoading(false);
   };
 
   const submitAsk = async () => {
     const question = askText.trim();
-    if (!question || askLoading) return;
+    if (!question || askLoading || qaActive) return;
+    askAbortRef.current?.abort();
+    const controller = new AbortController();
+    askAbortRef.current = controller;
+    const requestId = ++askRequestIdRef.current;
     setAskLoading(true);
     setAskError(null);
 
     const el = audioRef.current;
     const resumeTime = el?.currentTime ?? 0;
+    const mainIdx = currentIndex;
 
     // Pass the last few transcript lines for conversational grounding.
     const recent = clips
-      .slice(Math.max(0, currentIndex - 4), currentIndex + 1)
+      .slice(Math.max(0, mainIdx - 4), mainIdx + 1)
       .filter((c): c is Clip => c != null)
       .map((c) => ({ speaker: c.speaker, text: c.text }));
 
@@ -533,32 +661,43 @@ export default function App() {
           recent,
           expertise,
         }),
+        signal: controller.signal,
       });
+      if (requestId !== askRequestIdRef.current || controller.signal.aborted) return;
       if (!res.ok) {
-        setAskError(`Server returned ${res.status}`);
-        setAskLoading(false);
+        const message = await responseErrorMessage(res, `Server returned ${res.status}`);
+        if (requestId !== askRequestIdRef.current || controller.signal.aborted) return;
+        setAskError(message);
         return;
       }
       const data = await res.json();
-      const turns: Clip[] = data.turns;
-      if (!turns || turns.length === 0) {
+      if (requestId !== askRequestIdRef.current || controller.signal.aborted) return;
+      const turns = Array.isArray(data.turns) ? data.turns.filter(isPlayableClip) : [];
+      if (turns.length === 0 || turns.length !== data.turns?.length) {
         setAskError("No answer came back. Try rephrasing.");
-        setAskLoading(false);
         return;
       }
       setQaByMainIdx((prev) => {
         const next = { ...prev };
-        next[currentIndex] = [...(next[currentIndex] ?? []), ...turns];
+        next[mainIdx] = [...(next[mainIdx] ?? []), ...turns];
         return next;
       });
-      setQaActive({ mainIdx: currentIndex, resumeTime, turns });
+      setQaActive({ mainIdx, resumeTime, turns });
       setQaTurnIdx(0);
-      setAskLoading(false);
       setAskOpen(false);
       setAskText("");
-    } catch (e) {
+    } catch (err) {
+      if (controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) {
+        return;
+      }
       setAskError("Couldn't reach the backend.");
-      setAskLoading(false);
+    } finally {
+      if (requestId === askRequestIdRef.current) {
+        setAskLoading(false);
+      }
+      if (askAbortRef.current === controller) {
+        askAbortRef.current = null;
+      }
     }
   };
 
@@ -567,6 +706,7 @@ export default function App() {
     const onKey = (e: globalThis.KeyboardEvent) => {
       if (stage !== "ready") return;
       if (askOpen) return;
+      if (qaActive && (e.key === "a" || e.key === "A")) return;
       const target = e.target as HTMLElement | null;
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
       if (e.key === "a" || e.key === "A") {
@@ -580,13 +720,13 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stage, askOpen, paperText]);
+  }, [stage, askOpen, paperText, qaActive]);
 
   // ---------------------------------------------------------------------------
   // Download full episode (concatenated mp3, includes Q&A in order)
   // ---------------------------------------------------------------------------
 
-  const canDownload = stage === "ready" && clips.every((c) => c != null);
+  const canDownload = stage === "ready" && clips.every((c) => c != null && c.audio.length > 0);
   const downloadEpisode = () => {
     if (!canDownload) return;
     const ordered: Clip[] = [];
@@ -595,12 +735,13 @@ export default function App() {
       const qa = qaByMainIdx[i];
       if (qa) ordered.push(...qa);
     }
-    const parts: Uint8Array[] = [];
+    const parts: BlobPart[] = [];
     for (const c of ordered) {
       const bin = atob(c.audio);
-      const bytes = new Uint8Array(bin.length);
+      const buffer = new ArrayBuffer(bin.length);
+      const bytes = new Uint8Array(buffer);
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      parts.push(bytes);
+      parts.push(buffer);
     }
     const blob = new Blob(parts, { type: "audio/mpeg" });
     const url = URL.createObjectURL(blob);
@@ -700,7 +841,13 @@ export default function App() {
             seek={seek}
             canDownload={canDownload}
             downloadEpisode={downloadEpisode}
-            onJump={(i) => { setQaActive(null); setCurrentIndex(i); }}
+            onJump={(i) => {
+              if (qaActive) return;
+              shouldAutoPlayRef.current = isPlaying;
+              pendingMainSeekRef.current = null;
+              setQaTurnIdx(0);
+              setCurrentIndex(i);
+            }}
             onAsk={openAsk}
             canAsk={!!paperText}
             paperTitle={paperTitle}
@@ -719,7 +866,10 @@ export default function App() {
           type="file"
           accept="application/pdf,.pdf"
           className="hidden"
-          onChange={(e) => onFiles(e.target.files)}
+          onChange={(e) => {
+            onFiles(e.target.files);
+            e.currentTarget.value = "";
+          }}
         />
       </main>
 
