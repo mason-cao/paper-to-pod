@@ -1,0 +1,62 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "SF Pro Display",
+    "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  --font-display: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  --color-ink: #f5f5f7;
+  --color-ink-dim: #a1a1aa;
+  --color-surface: #0a0a0f;
+  --color-surface-1: #111118;
+  --color-surface-2: #1a1a23;
+  --color-accent: #b3a4ff;
+  --color-accent-2: #7cc6ff;
+}
+
+html, body, #root { height: 100%; }
+
+html {
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 600px at 50% -10%, rgba(179, 164, 255, 0.18), transparent 60%),
+    radial-gradient(900px 500px at 90% 110%, rgba(124, 198, 255, 0.10), transparent 60%),
+    var(--color-surface);
+  min-height: 100vh;
+}
+
+::selection { background: rgba(179, 164, 255, 0.35); color: var(--color-ink); }
+
+/* Utility: soft vertical text-mask so long transcripts fade at edges */
+.mask-y {
+  -webkit-mask-image: linear-gradient(180deg, transparent, black 12%, black 88%, transparent);
+          mask-image: linear-gradient(180deg, transparent, black 12%, black 88%, transparent);
+}
+
+/* Slow ambient pulse for the idle hero orb */
+@keyframes p2p-breathe {
+  0%, 100% { transform: scale(1);   opacity: 0.55; }
+  50%      { transform: scale(1.08); opacity: 0.85; }
+}
+.animate-breathe { animation: p2p-breathe 6s ease-in-out infinite; }
+
+/* Subtle caret-like cursor on the active dialogue line */
+@keyframes p2p-blink {
+  0%, 60% { opacity: 1; }
+  61%, 100% { opacity: 0.35; }
+}
+.animate-softblink { animation: p2p-blink 1.2s ease-in-out infinite; }
+
+/* Rotating conic border for the dropzone when idle/drag */
+@keyframes p2p-spin { to { transform: rotate(360deg); } }
+.animate-slow-spin { animation: p2p-spin 14s linear infinite; }
