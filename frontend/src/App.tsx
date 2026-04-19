@@ -19,7 +19,7 @@ import {
 //      follow-up grounded in the paper text.
 // -----------------------------------------------------------------------------
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
 type SpeakerName = "Alex" | "Sam";
 type Expertise = "eli5" | "undergrad" | "expert";
