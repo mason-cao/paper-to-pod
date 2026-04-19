@@ -14,7 +14,7 @@ Everything runs straight through: one PDF in, one podcast out, no account, no da
 
 NotebookLM turns papers into monologue-style audio overviews. Paper2Pod is a **live conversation you can interrupt**. The headline feature isn't the script. It's the `Ask Alex` overlay that pauses the episode, takes your follow-up, generates a voiced exchange grounded in the paper, and resumes.
 
-We also pitch the script at the listener's level (*Explain like I'm 15*, *Curious outsider*, *Grad student*), stream every pipeline stage to the UI over SSE, synthesize voice lines concurrently so audio starts before the full episode is done rendering, and let you download the whole thing (including your Q&A interjections) as a single MP3.
+We also pitch the script at the listener's level (_Explain like I'm 15_, _Curious outsider_, _Grad student_), stream every pipeline stage to the UI over SSE, synthesize voice lines concurrently so audio starts before the full episode is done rendering, and let you download the whole thing (including your Q&A interjections) as a single MP3.
 
 ---
 
@@ -22,7 +22,7 @@ We also pitch the script at the listener's level (*Explain like I'm 15*, *Curiou
 
 ### Best Use of Gemini API
 
-Gemini 2.5 Flash is the creative and reasoning core of the app:
+Gemini 2.5 Flash Lite is the creative and reasoning core of the app:
 
 - **Structured dialogue synthesis.** A system prompt with cast definitions, pacing constraints, and spoken-style rules (contractions, disfluencies, no stage directions) produces a strict JSON array of turns via Gemini's `response_mime_type="application/json"`.
 - **Long-context grounding.** The full paper (up to ~180K chars) is passed in a single shot, with no chunking and no vector store, because Flash handles it cleanly.
@@ -35,7 +35,7 @@ ElevenLabs is responsible for every sound the user hears:
 
 - **Two distinct, expressive voices** (Adam for Alex, Bella for Sam) synthesized via `eleven_turbo_v2_5` for production-latency playback.
 - **Concurrent TTS.** Lines are rendered in parallel behind an `asyncio.Semaphore(4)`, with clips streamed to the client by base64 over SSE as each one completes. Listeners start hearing the episode before the last lines are even rendered.
-- **An interactive audio companion.** The `Ask Alex` feature makes the podcast *conversational*: the user's typed question becomes a fresh, in-character, emotionally-pitched exchange generated on the fly. This is the prize brief's "interactive AI companion" made literal.
+- **An interactive audio companion.** The `Ask Alex` feature makes the podcast _conversational_: the user's typed question becomes a fresh, in-character, emotionally-pitched exchange generated on the fly. This is the prize brief's "interactive AI companion" made literal.
 - **Client-side concatenation.** All clips (including inserted Q&A turns) can be downloaded as a single MP3, assembled in the browser with no re-encoding.
 
 ---
@@ -125,17 +125,17 @@ paper-to-pod/
 
 ## Feature matrix
 
-| Feature | Where it lives | Why it scores |
-|---|---|---|
-| SSE streaming pipeline | `backend/main.py` · `/api/process` | Real progress UI. Judges see real stage transitions, not fake spinners |
-| Concurrent TTS with `asyncio.Semaphore` | `backend/main.py` · `worker()` | ~4× faster episode generation; clips start arriving before the rest finish |
-| Ask Alex mid-episode Q&A | `backend/main.py` · `/api/ask`, `AskModal` in `App.tsx` | Core originality play, novel vs NotebookLM, doubles Gemini + ElevenLabs usage |
-| Expertise calibration | `EXPERTISE_FLAVOR` in backend, pills in Hero | Same paper, three very different episodes. Easy to demo in a video |
-| Auto paper-title extraction | `guess_title()` | Header polish; no extra call |
-| Radial Web Audio visualizer | `useAudioVisualizer` | Speaker-tinted frequency bars driven by `AnalyserNode` |
-| Click-to-jump transcript | `Player` component | UX signal, shows Q&A inline under the clip it was inserted after |
-| Download full episode as MP3 | `downloadEpisode()` | Client-side byte concatenation across main + Q&A clips |
-| Keyboard shortcuts | `Space` = play/pause, `A` = Ask Alex | Demo-friendly |
+| Feature                                 | Where it lives                                          | Why it scores                                                                 |
+| --------------------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| SSE streaming pipeline                  | `backend/main.py` · `/api/process`                      | Real progress UI. Judges see real stage transitions, not fake spinners        |
+| Concurrent TTS with `asyncio.Semaphore` | `backend/main.py` · `worker()`                          | ~4× faster episode generation; clips start arriving before the rest finish    |
+| Ask Alex mid-episode Q&A                | `backend/main.py` · `/api/ask`, `AskModal` in `App.tsx` | Core originality play, novel vs NotebookLM, doubles Gemini + ElevenLabs usage |
+| Expertise calibration                   | `EXPERTISE_FLAVOR` in backend, pills in Hero            | Same paper, three very different episodes. Easy to demo in a video            |
+| Auto paper-title extraction             | `guess_title()`                                         | Header polish; no extra call                                                  |
+| Radial Web Audio visualizer             | `useAudioVisualizer`                                    | Speaker-tinted frequency bars driven by `AnalyserNode`                        |
+| Click-to-jump transcript                | `Player` component                                      | UX signal, shows Q&A inline under the clip it was inserted after              |
+| Download full episode as MP3            | `downloadEpisode()`                                     | Client-side byte concatenation across main + Q&A clips                        |
+| Keyboard shortcuts                      | `Space` = play/pause, `A` = Ask Alex                    | Demo-friendly                                                                 |
 
 ---
 
