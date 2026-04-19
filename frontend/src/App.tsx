@@ -294,7 +294,7 @@ export default function App() {
         return;
       }
       if (processAbortRef.current === controller) processAbortRef.current = null;
-      setError("Could not reach the backend. Is it running on :8000?");
+      setError(`Could not reach the backend at ${API_BASE}. Check the deployment URL and CORS settings.`);
       setStage("error");
       return;
     }
