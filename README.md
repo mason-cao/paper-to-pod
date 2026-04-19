@@ -25,7 +25,7 @@ We also pitch the script at the listener's level (_Explain like I'm 15_, _Curiou
 Gemini 2.5 Flash Lite is the creative and reasoning core of the app:
 
 - **Structured dialogue synthesis.** A system prompt with cast definitions, pacing constraints, and spoken-style rules (contractions, disfluencies, no stage directions) produces a strict JSON array of turns via Gemini's `response_mime_type="application/json"`.
-- **Long-context grounding.** The full paper (up to ~180K chars) is passed in a single shot, with no chunking and no vector store, because Flash handles it cleanly.
+- **Long-context grounding.** The full paper (up to ~60K chars) is passed in a single shot, with no chunking and no vector store, because Flash handles it cleanly.
 - **Dynamic audience calibration.** The system prompt is composed at request time from one of three expertise profiles (ELI5 / Undergrad / Grad student), demonstrably shifting vocabulary, analogy density, and depth.
 - **Two-role generation for the Q&A feature.** When the user asks a follow-up, Gemini is called twice: first to rephrase the question in Sam's voice, then to answer as Alex using the paper as ground truth. Both answers chain through TTS.
 
