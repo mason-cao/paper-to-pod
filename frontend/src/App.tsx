@@ -21,14 +21,22 @@ import {
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
+const ELEVENLABS_KEY = import.meta.env.VITE_ELEVENLABS_API_KEY ?? "";
+const ELEVENLABS_MODEL = import.meta.env.VITE_ELEVENLABS_MODEL ?? "eleven_turbo_v2_5";
+const ALEX_VOICE_ID = import.meta.env.VITE_ALEX_VOICE_ID ?? "pNInz6obpgDQGcFmaJgB";
+const SAM_VOICE_ID = import.meta.env.VITE_SAM_VOICE_ID ?? "hpp4J3VqNfWAUOO0d1Us";
+const CLIENT_TTS_ENABLED = ELEVENLABS_KEY.length > 0;
+
 type SpeakerName = "Alex" | "Sam";
 type Expertise = "eli5" | "undergrad" | "expert";
 
+// "pending" = clip is in flight to client-side ElevenLabs synth. Playback
+// waits instead of starting Web Speech; effect re-runs when audio arrives.
 interface Clip {
   speaker: SpeakerName;
   text: string;
-  audio: string; // base64 mp3 when server TTS succeeds
-  ttsMode?: "server" | "browser";
+  audio: string; // base64 mp3 when TTS (server or client) succeeds
+  ttsMode?: "server" | "browser" | "pending";
   receipts?: SourceReceipt[];
 }
 
@@ -71,6 +79,48 @@ function base64ToBlobUrl(b64: string, mime = "audio/mpeg"): string {
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return URL.createObjectURL(new Blob([bytes], { type: mime }));
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const chunk = 0x8000;
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(
+      null,
+      Array.from(bytes.subarray(i, Math.min(i + chunk, bytes.length))),
+    );
+  }
+  return btoa(bin);
+}
+
+function voiceIdForSpeaker(speaker: SpeakerName): string {
+  return speaker === "Alex" ? ALEX_VOICE_ID : SAM_VOICE_ID;
+}
+
+async function synthesizeWithElevenLabs(
+  text: string,
+  speaker: SpeakerName,
+  signal?: AbortSignal,
+): Promise<string> {
+  const voiceId = voiceIdForSpeaker(speaker);
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "xi-api-key": ELEVENLABS_KEY,
+      "Content-Type": "application/json",
+      "Accept": "audio/mpeg",
+    },
+    body: JSON.stringify({ text, model_id: ELEVENLABS_MODEL }),
+    signal,
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`ElevenLabs ${res.status}: ${body.slice(0, 200)}`);
+  }
+  const buf = await res.arrayBuffer();
+  return arrayBufferToBase64(buf);
 }
 
 function formatTime(sec: number): string {
@@ -378,7 +428,12 @@ export default function App() {
       typeof value.text === "string" &&
       value.text.trim().length > 0 &&
       typeof value.audio === "string" &&
-      (value.audio.length > 0 || value.ttsMode === "browser")
+      (
+        value.audio.length > 0 ||
+        value.ttsMode === "browser" ||
+        value.ttsMode === "pending" ||
+        CLIENT_TTS_ENABLED
+      )
     );
   };
 
@@ -464,18 +519,67 @@ export default function App() {
           setStage("error");
           break;
         }
-        setClips((prev) => {
-          const next = prev.slice();
-          next[ev.index] = {
-            speaker: ev.speaker,
-            text: ev.text,
-            audio: ev.audio,
-            ttsMode: ev.ttsMode === "browser" ? "browser" : "server",
-            receipts: lineReceiptsRef.current[ev.index] ?? [],
-          };
-          return next;
-        });
-        setProgress({ done: ev.done, total: ev.total });
+        {
+          const hasServerAudio = ev.audio.length > 0;
+          const wantsClientSynth = !hasServerAudio && CLIENT_TTS_ENABLED;
+          const ttsMode: "server" | "browser" | "pending" = hasServerAudio
+            ? "server"
+            : wantsClientSynth ? "pending" : "browser";
+          setClips((prev) => {
+            const next = prev.slice();
+            next[ev.index] = {
+              speaker: ev.speaker,
+              text: ev.text,
+              audio: ev.audio,
+              ttsMode,
+              receipts: lineReceiptsRef.current[ev.index] ?? [],
+            };
+            return next;
+          });
+          if (hasServerAudio) {
+            setProgress({ done: ev.done, total: ev.total });
+          } else if (!wantsClientSynth) {
+            setProgress({ done: ev.done, total: ev.total });
+          }
+          if (wantsClientSynth) {
+            const requestId = processRequestIdRef.current;
+            const signal = processAbortRef.current?.signal;
+            synthesizeWithElevenLabs(ev.text, ev.speaker, signal)
+              .then((audio) => {
+                if (processRequestIdRef.current !== requestId) return;
+                if (signal?.aborted) return;
+                setClips((prev) => {
+                  if (processRequestIdRef.current !== requestId) return prev;
+                  const existing = prev[ev.index];
+                  if (!existing) return prev;
+                  const next = prev.slice();
+                  next[ev.index] = { ...existing, audio, ttsMode: "server" };
+                  return next;
+                });
+                setProgress((prev) => ({
+                  done: Math.min(prev.total || ev.total, prev.done + 1),
+                  total: prev.total || ev.total,
+                }));
+              })
+              .catch((err) => {
+                if (processRequestIdRef.current !== requestId) return;
+                if (signal?.aborted) return;
+                console.warn("[paper2pod] ElevenLabs client synth failed:", err);
+                setClips((prev) => {
+                  if (processRequestIdRef.current !== requestId) return prev;
+                  const existing = prev[ev.index];
+                  if (!existing) return prev;
+                  const next = prev.slice();
+                  next[ev.index] = { ...existing, ttsMode: "browser" };
+                  return next;
+                });
+                setProgress((prev) => ({
+                  done: Math.min(prev.total || ev.total, prev.done + 1),
+                  total: prev.total || ev.total,
+                }));
+              });
+          }
+        }
         break;
       case "tts_unavailable":
         console.warn("[paper2pod]", ev.message);
@@ -567,7 +671,8 @@ export default function App() {
   // ---------------------------------------------------------------------------
 
   const totalClips = clips.length;
-  const currentClipUsesBrowserSpeech = !!currentClip && (!currentClip.audio || currentClip.ttsMode === "browser");
+  const currentClipUsesBrowserSpeech = !!currentClip && currentClip.ttsMode === "browser";
+  const currentClipIsPending = !!currentClip && currentClip.ttsMode === "pending";
 
   const advanceAfterCurrent = useCallback(() => {
     if (qaActive) {
@@ -708,6 +813,20 @@ export default function App() {
       setAwaitingNext(!qaActive && totalClips > 0 && currentIndex < totalClips);
       return;
     }
+    if (clip.ttsMode === "pending") {
+      stopBrowserSpeech(true);
+      el.pause();
+      el.removeAttribute("src");
+      el.load();
+      if (currentUrlRef.current) {
+        URL.revokeObjectURL(currentUrlRef.current);
+        currentUrlRef.current = null;
+      }
+      setAwaitingNext(true);
+      setDuration(estimateSpeechDuration(clip.text));
+      setCurrentTime(0);
+      return;
+    }
     if (!clip.audio || clip.ttsMode === "browser") {
       stopBrowserSpeech(true);
       el.pause();
@@ -774,6 +893,10 @@ export default function App() {
 
   const togglePlay = () => {
     const el = audioRef.current;
+    if (currentClipIsPending) {
+      shouldAutoPlayRef.current = !shouldAutoPlayRef.current;
+      return;
+    }
     if (currentClipUsesBrowserSpeech && currentClip) {
       shouldAutoPlayRef.current = true;
       if (!browserSpeechRef.current) {
@@ -922,7 +1045,7 @@ export default function App() {
       const data = await res.json();
       if (requestId !== askRequestIdRef.current || controller.signal.aborted) return;
       const responseReceipts = normalizeReceipts(data.receipts);
-      const turns = Array.isArray(data.turns)
+      const rawTurns: Clip[] = Array.isArray(data.turns)
         ? data.turns
             .filter(isPlayableClip)
             .map((turn: Clip) => ({
@@ -932,10 +1055,28 @@ export default function App() {
                 : turn.speaker === "Alex" ? responseReceipts : [],
             }))
         : [];
-      if (turns.length === 0 || turns.length !== data.turns?.length) {
+      if (rawTurns.length === 0 || rawTurns.length !== data.turns?.length) {
         setAskError("No answer came back. Try rephrasing.");
         return;
       }
+      const turns: Clip[] = CLIENT_TTS_ENABLED && rawTurns.some((t) => !t.audio)
+        ? await Promise.all(rawTurns.map(async (turn) => {
+            if (turn.audio) return { ...turn, ttsMode: "server" as const };
+            try {
+              const audio = await synthesizeWithElevenLabs(
+                turn.text,
+                turn.speaker,
+                controller.signal,
+              );
+              return { ...turn, audio, ttsMode: "server" as const };
+            } catch (err) {
+              if (controller.signal.aborted) throw err;
+              console.warn("[paper2pod] ask turn synth failed:", err);
+              return { ...turn, ttsMode: "browser" as const };
+            }
+          }))
+        : rawTurns;
+      if (requestId !== askRequestIdRef.current || controller.signal.aborted) return;
       const nextSuggestions = normalizeSuggestions(data.suggestions);
       if (nextSuggestions.length) setSuggestedQuestions(nextSuggestions);
       setQaByMainIdx((prev) => {

@@ -39,8 +39,8 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
-if not GEMINI_API_KEY or not ELEVENLABS_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY and ELEVENLABS_API_KEY must be set in .env")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY must be set in .env")
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -76,11 +76,19 @@ FRONTEND_ORIGINS = [
 FRONTEND_ORIGIN_REGEX = os.getenv("FRONTEND_ORIGIN_REGEX") or None
 
 genai.configure(api_key=GEMINI_API_KEY)
-eleven = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
 
 def server_tts_enabled() -> bool:
     return TTS_MODE not in {"browser", "off", "disabled", "none"}
+
+
+if server_tts_enabled() and not ELEVENLABS_API_KEY:
+    raise RuntimeError(
+        "ELEVENLABS_API_KEY must be set when TTS_MODE=server. "
+        "Set TTS_MODE=browser to synthesize audio client-side instead."
+    )
+
+eleven = ElevenLabs(api_key=ELEVENLABS_API_KEY) if ELEVENLABS_API_KEY else None
 
 Expertise = Literal["eli5", "undergrad", "expert"]
 
