@@ -37,3 +37,4 @@ yarn-error.log*
 *.mp3
 *.wav
 audio_out/
+.vercel

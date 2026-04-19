@@ -63,6 +63,7 @@ SAM_VOICE_ID = os.getenv("SAM_VOICE_ID", "hpp4J3VqNfWAUOO0d1Us")    # Bella
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 ELEVEN_MODEL = os.getenv("ELEVEN_MODEL", "eleven_turbo_v2_5")
+TTS_MODE = os.getenv("TTS_MODE", "server").strip().lower()
 TTS_CONCURRENCY = _env_int("TTS_CONCURRENCY", 4)
 MAX_PDF_CHARS = _env_int("MAX_PDF_CHARS", 180000, minimum=1000)
 MAX_RECEIPT_CHARS = 420
@@ -76,6 +77,10 @@ FRONTEND_ORIGIN_REGEX = os.getenv("FRONTEND_ORIGIN_REGEX") or None
 
 genai.configure(api_key=GEMINI_API_KEY)
 eleven = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+
+
+def server_tts_enabled() -> bool:
+    return TTS_MODE not in {"browser", "off", "disabled", "none"}
 
 Expertise = Literal["eli5", "undergrad", "expert"]
 
@@ -496,6 +501,49 @@ async def synthesize_line(text: str, speaker: str) -> bytes:
     return await asyncio.to_thread(_synthesize_sync, clean_text, voice_id, speaker)
 
 
+def public_tts_error(exc: Exception) -> str:
+    raw = str(exc)
+    lowered = raw.lower()
+    if "detected_unusual_activity" in lowered or "free tier usage disabled" in lowered:
+        return (
+            "ElevenLabs rejected server-side synthesis from this hosted backend. "
+            "Playing with browser speech instead."
+        )
+    if "status_code: 401" in lowered or "unauthorized" in lowered:
+        return (
+            "ElevenLabs rejected the configured API key for server-side synthesis. "
+            "Playing with browser speech instead."
+        )
+    if "quota" in lowered or "rate" in lowered or "429" in lowered:
+        return (
+            "ElevenLabs rate limits or quota prevented server-side synthesis. "
+            "Playing with browser speech instead."
+        )
+    return "Server-side audio synthesis failed. Playing with browser speech instead."
+
+
+async def browser_tts_events(
+    dialogue: list[dict[str, str]],
+    message: str | None = None,
+) -> AsyncIterator[str]:
+    total = len(dialogue)
+    if message:
+        yield _sse({"stage": "tts_unavailable", "message": message})
+    yield _sse({"stage": "synthesizing", "done": 0, "total": total, "ttsMode": "browser"})
+    for idx, line in enumerate(dialogue):
+        yield _sse({
+            "stage": "clip",
+            "index": idx,
+            "speaker": line["speaker"],
+            "text": line["text"],
+            "audio": "",
+            "ttsMode": "browser",
+            "done": idx + 1,
+            "total": total,
+        })
+    yield _sse({"stage": "done", "total": total, "ttsMode": "browser"})
+
+
 # --------------------------------------------------------------------------- #
 # SSE streaming endpoint
 # --------------------------------------------------------------------------- #
@@ -549,6 +597,11 @@ async def process(
                 "suggestions": suggestions,
             })
 
+            if not server_tts_enabled():
+                async for event in browser_tts_events(dialogue):
+                    yield event
+                return
+
             total = len(dialogue)
             yield _sse({"stage": "synthesizing", "done": 0, "total": total})
 
@@ -564,11 +617,7 @@ async def process(
                         await ready_queue.put((
                             -1,
                             {
-                                "error": (
-                                    f"Failed to synthesize line {idx + 1} "
-                                    f"({line.get('speaker', 'unknown')}): "
-                                    f"{type(exc).__name__}: {exc}"
-                                ),
+                                "error": public_tts_error(exc),
                                 "idx": idx,
                             },
                             b"",
@@ -583,7 +632,11 @@ async def process(
                     for task in tasks:
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
-                    yield _sse({"stage": "error", "message": line.get("error", "Audio synthesis failed")})
+                    async for event in browser_tts_events(
+                        dialogue,
+                        line.get("error", "Audio synthesis failed"),
+                    ):
+                        yield event
                     return
                 done += 1
                 yield _sse({
@@ -695,18 +748,53 @@ async def ask(req: AskRequest) -> dict[str, Any]:
         focus=req.question,
     ))
 
+    if not server_tts_enabled():
+        try:
+            suggestions = await followup_task
+        except Exception:
+            suggestions = fallback_suggestions()
+        return {
+            "turns": [
+                {"speaker": "Sam", "text": sam_line, "audio": "", "ttsMode": "browser"},
+                {
+                    "speaker": "Alex",
+                    "text": alex_line,
+                    "audio": "",
+                    "ttsMode": "browser",
+                    "receipts": receipts,
+                },
+            ],
+            "receipts": receipts,
+            "suggestions": suggestions,
+            "ttsMode": "browser",
+        }
+
     try:
         sam_audio, alex_audio = await asyncio.gather(
             synthesize_line(sam_line, "Sam"),
             synthesize_line(alex_line, "Alex"),
         )
     except Exception as exc:  # noqa: BLE001
-        followup_task.cancel()
-        await asyncio.gather(followup_task, return_exceptions=True)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Audio synthesis failed: {type(exc).__name__}: {exc}",
-        ) from exc
+        try:
+            suggestions = await followup_task
+        except Exception:
+            suggestions = fallback_suggestions()
+        return {
+            "turns": [
+                {"speaker": "Sam", "text": sam_line, "audio": "", "ttsMode": "browser"},
+                {
+                    "speaker": "Alex",
+                    "text": alex_line,
+                    "audio": "",
+                    "ttsMode": "browser",
+                    "receipts": receipts,
+                },
+            ],
+            "receipts": receipts,
+            "suggestions": suggestions,
+            "ttsMode": "browser",
+            "ttsWarning": public_tts_error(exc),
+        }
 
     try:
         suggestions = await followup_task

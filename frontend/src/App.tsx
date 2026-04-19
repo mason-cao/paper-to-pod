@@ -27,7 +27,8 @@ type Expertise = "eli5" | "undergrad" | "expert";
 interface Clip {
   speaker: SpeakerName;
   text: string;
-  audio: string; // base64 mp3
+  audio: string; // base64 mp3 when server TTS succeeds
+  ttsMode?: "server" | "browser";
   receipts?: SourceReceipt[];
 }
 
@@ -77,6 +78,18 @@ function formatTime(sec: number): string {
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60).toString().padStart(2, "0");
   return `${m}:${s}`;
+}
+
+function estimateSpeechDuration(text: string): number {
+  const words = text.trim().split(/\s+/).filter(Boolean).length;
+  return Math.max(2, words / 2.6);
+}
+
+function speechTextFromOffset(text: string, seconds: number): string {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  if (!words.length || seconds <= 0) return text;
+  const start = Math.min(words.length - 1, Math.floor(seconds * 2.6));
+  return words.slice(start).join(" ");
 }
 
 async function responseErrorMessage(res: Response, fallback: string): Promise<string> {
@@ -245,6 +258,14 @@ export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const currentUrlRef = useRef<string | null>(null);
+  const browserSpeechRef = useRef<{
+    id: number;
+    duration: number;
+    elapsedBeforePause: number;
+    startedAt: number;
+    timer: number | null;
+  } | null>(null);
+  const browserSpeechIdRef = useRef(0);
   const askInputRef = useRef<HTMLTextAreaElement>(null);
   const processAbortRef = useRef<AbortController | null>(null);
   const processRequestIdRef = useRef(0);
@@ -357,7 +378,7 @@ export default function App() {
       typeof value.text === "string" &&
       value.text.trim().length > 0 &&
       typeof value.audio === "string" &&
-      value.audio.length > 0
+      (value.audio.length > 0 || value.ttsMode === "browser")
     );
   };
 
@@ -449,11 +470,15 @@ export default function App() {
             speaker: ev.speaker,
             text: ev.text,
             audio: ev.audio,
+            ttsMode: ev.ttsMode === "browser" ? "browser" : "server",
             receipts: lineReceiptsRef.current[ev.index] ?? [],
           };
           return next;
         });
         setProgress({ done: ev.done, total: ev.total });
+        break;
+      case "tts_unavailable":
+        console.warn("[paper2pod]", ev.message);
         break;
       case "done":
         setStage("ready");
@@ -484,6 +509,7 @@ export default function App() {
     shouldAutoPlayRef.current = false;
     pendingMainSeekRef.current = null;
     lineReceiptsRef.current = {};
+    stopBrowserSpeech(true);
     const el = audioRef.current;
     if (el) {
       el.pause();
@@ -541,6 +567,138 @@ export default function App() {
   // ---------------------------------------------------------------------------
 
   const totalClips = clips.length;
+  const currentClipUsesBrowserSpeech = !!currentClip && (!currentClip.audio || currentClip.ttsMode === "browser");
+
+  const advanceAfterCurrent = useCallback(() => {
+    if (qaActive) {
+      if (qaTurnIdx < qaActive.turns.length - 1) {
+        setQaTurnIdx((i) => i + 1);
+        return;
+      }
+      // End of Q&A overlay -> resume main episode where we left off.
+      const resume = qaActive;
+      pendingMainSeekRef.current = resume.resumeTime;
+      shouldAutoPlayRef.current = true;
+      setQaActive(null);
+      setQaTurnIdx(0);
+      setCurrentIndex(resume.mainIdx);
+      return;
+    }
+    if (currentIndex < totalClips - 1) {
+      shouldAutoPlayRef.current = true;
+      setCurrentIndex((i) => i + 1);
+    } else {
+      shouldAutoPlayRef.current = false;
+      setIsPlaying(false);
+    }
+  }, [currentIndex, qaActive, qaTurnIdx, totalClips]);
+
+  const clearBrowserSpeechTimer = useCallback(() => {
+    const state = browserSpeechRef.current;
+    if (state?.timer != null) {
+      window.clearInterval(state.timer);
+      state.timer = null;
+    }
+  }, []);
+
+  const stopBrowserSpeech = useCallback((cancel = true) => {
+    clearBrowserSpeechTimer();
+    browserSpeechRef.current = null;
+    if (cancel && "speechSynthesis" in window) {
+      browserSpeechIdRef.current += 1;
+      window.speechSynthesis.cancel();
+    }
+  }, [clearBrowserSpeechTimer]);
+
+  const browserSpeechElapsed = useCallback(() => {
+    const state = browserSpeechRef.current;
+    if (!state) return 0;
+    return Math.min(
+      state.duration,
+      state.elapsedBeforePause + (performance.now() - state.startedAt) / 1000,
+    );
+  }, []);
+
+  const startBrowserSpeech = useCallback((clip: Clip, offsetSeconds = 0) => {
+    if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
+      setError("This browser does not support built-in speech playback.");
+      setStage("error");
+      return;
+    }
+
+    stopBrowserSpeech(true);
+    const duration = estimateSpeechDuration(clip.text);
+    const startAt = Math.max(0, Math.min(duration - 0.2, offsetSeconds));
+    const text = speechTextFromOffset(clip.text, startAt);
+    const id = ++browserSpeechIdRef.current;
+    const utterance = new SpeechSynthesisUtterance(text);
+    const voices = window.speechSynthesis.getVoices();
+    const preferred = clip.speaker === "Sam"
+      ? voices.find((v) => /samantha|female|google us english/i.test(v.name))
+      : voices.find((v) => /daniel|male|google uk english male|alex/i.test(v.name));
+    if (preferred) utterance.voice = preferred;
+    utterance.rate = clip.speaker === "Sam" ? 1.03 : 0.96;
+    utterance.pitch = clip.speaker === "Sam" ? 1.08 : 0.92;
+
+    const state = {
+      id,
+      duration,
+      elapsedBeforePause: startAt,
+      startedAt: performance.now(),
+      timer: null as number | null,
+    };
+    browserSpeechRef.current = state;
+    setDuration(duration);
+    setCurrentTime(startAt);
+
+    const tick = () => {
+      if (browserSpeechRef.current?.id !== id) return;
+      setCurrentTime(browserSpeechElapsed());
+    };
+    state.timer = window.setInterval(tick, 200);
+
+    utterance.onend = () => {
+      if (browserSpeechRef.current?.id !== id) return;
+      setCurrentTime(duration);
+      stopBrowserSpeech(false);
+      setIsPlaying(false);
+      advanceAfterCurrent();
+    };
+    utterance.onerror = () => {
+      if (browserSpeechRef.current?.id !== id) return;
+      stopBrowserSpeech(false);
+      shouldAutoPlayRef.current = false;
+      setIsPlaying(false);
+      setError("Browser speech could not play this line.");
+      setStage("error");
+    };
+
+    window.speechSynthesis.speak(utterance);
+    setIsPlaying(true);
+  }, [advanceAfterCurrent, browserSpeechElapsed, stopBrowserSpeech]);
+
+  const pauseBrowserSpeech = useCallback(() => {
+    const state = browserSpeechRef.current;
+    if (!state || !("speechSynthesis" in window)) return;
+    state.elapsedBeforePause = browserSpeechElapsed();
+    clearBrowserSpeechTimer();
+    window.speechSynthesis.pause();
+    setCurrentTime(state.elapsedBeforePause);
+    setIsPlaying(false);
+  }, [browserSpeechElapsed, clearBrowserSpeechTimer]);
+
+  const resumeBrowserSpeech = useCallback(() => {
+    const state = browserSpeechRef.current;
+    if (!state || !("speechSynthesis" in window)) return;
+    state.startedAt = performance.now();
+    state.timer = window.setInterval(() => {
+      if (browserSpeechRef.current?.id === state.id) {
+        setCurrentTime(browserSpeechElapsed());
+      }
+    }, 200);
+    window.speechSynthesis.resume();
+    setIsPlaying(true);
+  }, [browserSpeechElapsed]);
 
   useEffect(() => {
     const el = audioRef.current;
@@ -549,6 +707,28 @@ export default function App() {
     if (!clip) {
       setAwaitingNext(!qaActive && totalClips > 0 && currentIndex < totalClips);
       return;
+    }
+    if (!clip.audio || clip.ttsMode === "browser") {
+      stopBrowserSpeech(true);
+      el.pause();
+      el.removeAttribute("src");
+      el.load();
+      if (currentUrlRef.current) {
+        URL.revokeObjectURL(currentUrlRef.current);
+        currentUrlRef.current = null;
+      }
+      const seekTo = pendingMainSeekRef.current ?? 0;
+      pendingMainSeekRef.current = null;
+      setAwaitingNext(false);
+      setDuration(estimateSpeechDuration(clip.text));
+      setCurrentTime(seekTo);
+      if (qaActive || shouldAutoPlayRef.current) {
+        startBrowserSpeech(clip, seekTo);
+      }
+      return () => stopBrowserSpeech(true);
+    }
+    if (browserSpeechRef.current) {
+      stopBrowserSpeech(true);
     }
     if (!clip.audio) {
       setError("Missing audio for the current line.");
@@ -590,10 +770,22 @@ export default function App() {
       if (hasPendingSeek) el.removeEventListener("loadedmetadata", onMeta);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentIndex, currentClip?.audio, qaActive?.mainIdx, qaTurnIdx, totalClips]);
+  }, [currentIndex, currentClip?.audio, currentClip?.text, currentClip?.ttsMode, qaActive?.mainIdx, qaTurnIdx, totalClips]);
 
   const togglePlay = () => {
     const el = audioRef.current;
+    if (currentClipUsesBrowserSpeech && currentClip) {
+      shouldAutoPlayRef.current = true;
+      if (!browserSpeechRef.current) {
+        startBrowserSpeech(currentClip, currentTime);
+      } else if (isPlaying) {
+        shouldAutoPlayRef.current = false;
+        pauseBrowserSpeech();
+      } else {
+        resumeBrowserSpeech();
+      }
+      return;
+    }
     if (!el) return;
     ensureGraph();
     if (el.paused) {
@@ -608,29 +800,7 @@ export default function App() {
     }
   };
 
-  const onEnded = () => {
-    if (qaActive) {
-      if (qaTurnIdx < qaActive.turns.length - 1) {
-        setQaTurnIdx((i) => i + 1);
-        return;
-      }
-      // End of Q&A overlay → resume main episode where we left off.
-      const resume = qaActive;
-      pendingMainSeekRef.current = resume.resumeTime;
-      shouldAutoPlayRef.current = true;
-      setQaActive(null);
-      setQaTurnIdx(0);
-      setCurrentIndex(resume.mainIdx);
-      return;
-    }
-    if (currentIndex < totalClips - 1) {
-      shouldAutoPlayRef.current = true;
-      setCurrentIndex((i) => i + 1);
-    } else {
-      shouldAutoPlayRef.current = false;
-      setIsPlaying(false);
-    }
-  };
+  const onEnded = advanceAfterCurrent;
 
   const onTimeUpdate = () => {
     const el = audioRef.current;
@@ -645,6 +815,14 @@ export default function App() {
   };
 
   const seek = (pct: number) => {
+    if (currentClipUsesBrowserSpeech && currentClip) {
+      const target = Math.max(0, Math.min(estimateSpeechDuration(currentClip.text), pct * estimateSpeechDuration(currentClip.text)));
+      setCurrentTime(target);
+      if (isPlaying) {
+        startBrowserSpeech(currentClip, target);
+      }
+      return;
+    }
     const el = audioRef.current;
     if (!el || !isFinite(duration)) return;
     el.currentTime = Math.max(0, Math.min(duration, pct * duration));
@@ -652,10 +830,21 @@ export default function App() {
 
   const skipNext = () => {
     if (qaActive) return;
+    stopBrowserSpeech(true);
     if (currentIndex < totalClips - 1) setCurrentIndex((i) => i + 1);
   };
   const skipPrev = () => {
     if (qaActive) return;
+    if (currentClipUsesBrowserSpeech && currentClip) {
+      if (currentTime > 2) {
+        if (isPlaying) startBrowserSpeech(currentClip, 0);
+        else setCurrentTime(0);
+        return;
+      }
+      stopBrowserSpeech(true);
+      if (currentIndex > 0) setCurrentIndex((i) => i - 1);
+      return;
+    }
     const el = audioRef.current;
     if (el && el.currentTime > 2) {
       el.currentTime = 0;
@@ -673,6 +862,7 @@ export default function App() {
     const el = audioRef.current;
     shouldAutoPlayRef.current = false;
     if (el) el.pause();
+    pauseBrowserSpeech();
     setAskText(prefill);
     setAskOpen(true);
     setTimeout(() => askInputRef.current?.focus(), 80);
