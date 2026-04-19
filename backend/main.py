@@ -54,6 +54,10 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
     return max(minimum, value)
 
 
+def _csv_env(name: str) -> list[str]:
+    return [item.strip().rstrip("/") for item in os.getenv(name, "").split(",") if item.strip()]
+
+
 ALEX_VOICE_ID = os.getenv("ALEX_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # Adam
 SAM_VOICE_ID = os.getenv("SAM_VOICE_ID", "hpp4J3VqNfWAUOO0d1Us")    # Bella
 
@@ -63,6 +67,11 @@ TTS_CONCURRENCY = _env_int("TTS_CONCURRENCY", 4)
 MAX_PDF_CHARS = _env_int("MAX_PDF_CHARS", 180000, minimum=1000)
 MAX_RECEIPT_CHARS = 420
 PAGE_MARKER_RE = re.compile(r"\[\[PAGE\s+(\d+)\]\]", re.IGNORECASE)
+FRONTEND_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    *_csv_env("FRONTEND_ORIGINS"),
+]
 
 genai.configure(api_key=GEMINI_API_KEY)
 eleven = ElevenLabs(api_key=ELEVENLABS_API_KEY)
@@ -127,7 +136,7 @@ app = FastAPI(title="Paper2Pod", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
