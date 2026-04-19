@@ -72,6 +72,7 @@ FRONTEND_ORIGINS = [
     "http://127.0.0.1:5173",
     *_csv_env("FRONTEND_ORIGINS"),
 ]
+FRONTEND_ORIGIN_REGEX = os.getenv("FRONTEND_ORIGIN_REGEX") or None
 
 genai.configure(api_key=GEMINI_API_KEY)
 eleven = ElevenLabs(api_key=ELEVENLABS_API_KEY)
@@ -137,6 +138,7 @@ app = FastAPI(title="Paper2Pod", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
+    allow_origin_regex=FRONTEND_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
