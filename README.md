@@ -8,7 +8,7 @@ Paper2Pod takes a PDF and hands you a streaming, fully-voiced conversation betwe
 
 Everything runs straight through: one PDF in, one podcast out, no account, no database, no ceremony.
 
-[Live Demo]([URL](https://frontend-rho-lilac-20.vercel.app/))
+[Live Demo](https://frontend-rho-lilac-20.vercel.app/)
 
 ---
 
